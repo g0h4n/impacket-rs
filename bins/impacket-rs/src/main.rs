@@ -5671,7 +5671,7 @@ fn cmd_ldapsearch(args: &[String]) {
     let attr_refs: Vec<&str> = attributes.iter().map(|s| s.as_str()).collect();
 
     println!("[*] Searching Base DN '{}' with filter '{}'...", base_dn, filter_str);
-    let entries = match client.search(&base_dn, SearchScope::WholeSubtree, filter_str.as_bytes(), &attr_refs) {
+    let entries = match client.search(&base_dn, SearchScope::WholeSubtree, &impacket_ldap::parse_filter_string(&filter_str), &attr_refs) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("[-] LDAP search failed: {}", e);
@@ -6948,7 +6948,7 @@ fn cmd_true_tree(args: &[String]) {
 
     let mut default_nc = String::new();
     let mut root_nc = String::new();
-    if let Ok(dse_entries) = client.search("", SearchScope::BaseObject, b"(objectClass=*)", &["defaultNamingContext", "rootDomainNamingContext"]) {
+    if let Ok(dse_entries) = client.search("", SearchScope::BaseObject, &impacket_ldap::filter_present("objectClass"), &["defaultNamingContext", "rootDomainNamingContext"]) {
         if let Some(dse) = dse_entries.first() {
             if let Some(raw) = dse.get_first_raw("defaultNamingContext") {
                 default_nc = String::from_utf8_lossy(raw).into_owned();
@@ -6972,7 +6972,7 @@ fn cmd_true_tree(args: &[String]) {
     println!("[*] Querying trusted domain objects under '{}'...", base_dn);
     let filter = "(objectClass=trustedDomain)";
     let attrs = ["trustPartner", "flatName", "trustDirection", "trustType", "trustAttributes", "securityIdentifier"];
-    let entries = match client.search(&base_dn, SearchScope::WholeSubtree, filter.as_bytes(), &attrs) {
+    let entries = match client.search(&base_dn, SearchScope::WholeSubtree, &impacket_ldap::parse_filter_string(&filter), &attrs) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("[-] Search failed: {}", e);
@@ -8547,7 +8547,7 @@ fn cmd_check_ldap_status(args: &[String]) {
         "dnsHostName",
         "serverName",
     ];
-    let res = client.search("", SearchScope::BaseObject, b"(objectClass=*)", &attrs);
+    let res = client.search("", SearchScope::BaseObject, &impacket_ldap::filter_present("objectClass"), &attrs);
     let entries = match res {
         Ok(e) => e,
         Err(e) => {

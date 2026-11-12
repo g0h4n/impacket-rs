@@ -13,7 +13,7 @@ pub mod shell;
 
 pub use addcomputer::{add_computer, build_computer_attributes, generate_computer_password};
 pub use asn1::{
-    filter_and, filter_equality, filter_not, filter_or, filter_present, op_tag, result_code,
+    filter_and, filter_equality, filter_not, filter_or, filter_present, parse_filter_string, op_tag, result_code,
     AttributeModification, BindAuth, LdapAttribute, LdapControl, LdapMessage, ModifyOperation,
     ProtocolOp, SearchScope, CONTROL_PAGED_RESULTS,
 };

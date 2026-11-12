@@ -912,12 +912,38 @@ pub fn build_tgs_req_der(
     let auth_der = der::encode_application(2, &auth_seq);
 
     // 2. Encrypted Authenticator with TGT session key (Key usage 7: AP-REQ Authenticator)
-    let mut confounder = [0u8; 8];
-    confounder[0..4].copy_from_slice(&nonce.to_le_bytes());
-    confounder[4..8].copy_from_slice(&(now_unix as u32).to_le_bytes());
-    let enc_auth = crypto::rc4_hmac_encrypt(&tgt.session_key, 7, &auth_der, &confounder);
+    // Use the TGT session key's real etype, not a hard-coded RC4.
+    let (enc_auth, auth_etype) = match tgt.session_key_etype {
+        18 => {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&tgt.session_key_bytes[..32]);
+            let mut confounder = [0u8; 16];
+            confounder[0..4].copy_from_slice(&nonce.to_le_bytes());
+            confounder[4..8].copy_from_slice(&(now_unix as u32).to_le_bytes());
+            let ct = crypto::aes256_cts_hmac_sha1_96_encrypt(&key, 7, &auth_der, &confounder)
+                .expect("aes256 authenticator encrypt");
+            (ct, 18)
+        }
+        17 => {
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&tgt.session_key_bytes[..16]);
+            let mut confounder = [0u8; 16];
+            confounder[0..4].copy_from_slice(&nonce.to_le_bytes());
+            confounder[4..8].copy_from_slice(&(now_unix as u32).to_le_bytes());
+            let ct = crypto::aes128_cts_hmac_sha1_96_encrypt(&key, 7, &auth_der, &confounder)
+                .expect("aes128 authenticator encrypt");
+            (ct, 17)
+        }
+        _ => {
+            // RC4 (etype 23)
+            let mut confounder = [0u8; 8];
+            confounder[0..4].copy_from_slice(&nonce.to_le_bytes());
+            confounder[4..8].copy_from_slice(&(now_unix as u32).to_le_bytes());
+            (crypto::rc4_hmac_encrypt(&tgt.session_key, 7, &auth_der, &confounder), 23)
+        }
+    };
     let enc_auth_data = der::encode_sequence(&[
-        der::encode_context_explicit(0, &der::encode_integer(23)),
+        der::encode_context_explicit(0, &der::encode_integer(auth_etype)),
         der::encode_context_explicit(2, &der::encode_octet_string(&enc_auth)),
     ]);
 

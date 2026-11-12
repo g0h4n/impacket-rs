@@ -169,13 +169,30 @@ impl Krb5TgsReq {
             let user_realm = der::encode_general_string(&self.user_realm);
             let auth_pkg = der::encode_general_string("Kerberos");
 
-            let cksum_data = [impersonate_user.as_bytes(), self.user_realm.as_bytes()].concat();
-            let (cksum_type, cksum_val) = if self.session_key_etype == 23 {
-                let k16: [u8; 16] = self.session_key.as_slice().try_into().unwrap_or([0u8; 16]);
-                (17i32, impacket_crypto::hmac_md5(&k16, &cksum_data).to_vec())
-            } else {
-                let k16: [u8; 16] = self.session_key.as_slice().try_into().unwrap_or([0u8; 16]);
-                (15i32, impacket_crypto::hmac_sha1_96(&k16, &cksum_data).to_vec())
+            // MS-SFU PA-FOR-USER checksum: over  name-type(LE u32) ‖ user ‖ realm ‖ "Kerberos",
+            // keyed with the TGT session key at key usage 17 (KERB_NON_KERB_CKSUM_SALT).
+            let mut cksum_data = Vec::new();
+            cksum_data.extend_from_slice(&1u32.to_le_bytes()); // name-type = NT-PRINCIPAL (1)
+            cksum_data.extend_from_slice(impersonate_user.as_bytes());
+            cksum_data.extend_from_slice(self.user_realm.as_bytes());
+            cksum_data.extend_from_slice(b"Kerberos");
+            let (cksum_type, cksum_val) = match self.session_key_etype {
+                23 => {
+                    let k16: [u8; 16] = self.session_key.as_slice().try_into().unwrap_or([0u8; 16]);
+                    (-138i32, crate::crypto::rc4_hmac_checksum(&k16, 17, &cksum_data).to_vec())
+                }
+                18 => {
+                    let k32: [u8; 32] = self.session_key.as_slice().try_into().unwrap_or([0u8; 32]);
+                    (16i32, crate::crypto::aes256_cts_hmac_sha1_96_checksum(&k32, 17, &cksum_data).to_vec())
+                }
+                17 => {
+                    let k16: [u8; 16] = self.session_key.as_slice().try_into().unwrap_or([0u8; 16]);
+                    (15i32, crate::crypto::aes128_cts_hmac_sha1_96_checksum(&k16, 17, &cksum_data).to_vec())
+                }
+                _ => {
+                    let k16: [u8; 16] = self.session_key.as_slice().try_into().unwrap_or([0u8; 16]);
+                    (-138i32, crate::crypto::rc4_hmac_checksum(&k16, 17, &cksum_data).to_vec())
+                }
             };
 
             let cksum_seq = der::encode_sequence(&[
@@ -196,6 +213,7 @@ impl Krb5TgsReq {
             ]);
             padata_elements.push(padata_s4u);
         }
+
         let padata_seq = der::encode_sequence(&padata_elements);
 
         // KDC-REQ-BODY
@@ -211,8 +229,11 @@ impl Krb5TgsReq {
             .iter()
             .map(|s| der::encode_general_string(s))
             .collect();
+        // NT-PRINCIPAL (1) for a single-component principal (S4U2Self target = the service account),
+        // NT-SRV-INST (2) for a real multi-component SPN (service/host).
+        let sname_name_type: i64 = if self.spn_components.len() > 1 { 2 } else { 1 };
         let sname = der::encode_sequence(&[
-            der::encode_context_explicit(0, &der::encode_integer(2)), // NT-SRV-INST
+            der::encode_context_explicit(0, &der::encode_integer(sname_name_type)),
             der::encode_context_explicit(1, &der::encode_sequence(&sname_components)),
         ]);
         let realm = der::encode_general_string(&self.realm);

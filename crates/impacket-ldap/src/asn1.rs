@@ -726,6 +726,51 @@ pub fn filter_not(filter: &[u8]) -> Vec<u8> {
     der::encode_context_explicit(2, filter)
 }
 
+/// Parse a textual LDAP filter like "(attr=value)", "(attr=*)", "(attr=pre*suf)"
+/// into its DER encoding. Supports a single equality/present/substring clause
+/// (enough for the CLI; nested &/|/! can be added later).
+pub fn parse_filter_string(s: &str) -> Vec<u8> {
+    let t = s.trim();
+    let inner = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(t);
+    if let Some(eq) = inner.find('=') {
+        let attr = &inner[..eq];
+        let val = &inner[eq + 1..];
+        if val == "*" {
+            // present: (attr=*)
+            return filter_present(attr);
+        }
+        if val.contains('*') {
+            // substring: (attr=a*b*c) -> [4] SubstringFilter
+            let parts: Vec<&str> = val.split('*').collect();
+            let mut subs = Vec::new();
+            // initial
+            if !parts[0].is_empty() {
+                subs.push(der::encode_tlv(0x80, parts[0].as_bytes())); // [0] initial
+            }
+            // any (middle parts)
+            for p in &parts[1..parts.len() - 1] {
+                if !p.is_empty() {
+                    subs.push(der::encode_tlv(0x81, p.as_bytes())); // [1] any
+                }
+            }
+            // final
+            let last = parts[parts.len() - 1];
+            if !last.is_empty() {
+                subs.push(der::encode_tlv(0x82, last.as_bytes())); // [2] final
+            }
+            let body = der::encode_sequence(&[
+                der::encode_octet_string(attr.as_bytes()),
+                der::encode_sequence(&subs),
+            ]);
+            return der::encode_context_explicit(4, &body[2..]); // [4] substrings
+        }
+        // equality
+        return filter_equality(attr, val);
+    }
+    // fallback: present of the whole thing
+    filter_present(inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
