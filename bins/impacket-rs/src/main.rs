@@ -8511,9 +8511,18 @@ fn cmd_get_laps_password(args: &[String]) {
 fn cmd_check_ldap_status(args: &[String]) {
     if args.is_empty() {
         eprintln!("Usage: impacket-rs CheckLDAPStatus <TARGET> [-port <PORT>]");
+        eprintln!("  Example: impacket-rs CheckLDAPStatus essos.local/user:pass@192.168.56.12");
         std::process::exit(1);
     }
-    let target = &args[0];
+
+    let spec = match parse_target_with_hashes(args) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[-] Error parsing target: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     let mut port: u16 = 389;
     let mut i = 1;
     while i < args.len() {
@@ -8527,7 +8536,9 @@ fn cmd_check_ldap_status(args: &[String]) {
             _ => i += 1,
         }
     }
-    let addr = format!("{}:{}", target, port);
+
+    let host = spec.effective_target_ip();
+    let addr = format!("{}:{}", host, port);
     println!("[*] Connecting to LDAP server at {}...", addr);
     let mut client = match LdapClient::connect(&addr, DEFAULT_TIMEOUT) {
         Ok(c) => c,
@@ -8536,6 +8547,30 @@ fn cmd_check_ldap_status(args: &[String]) {
             std::process::exit(1);
         }
     };
+
+    // Bind (simple) so the DC accepts the RootDSE query; anonymous if no creds given.
+    let bind_dn = if spec.username.is_empty() {
+        String::new()
+    } else if spec.username.contains('@') || spec.username.to_uppercase().contains("DC=") {
+        spec.username.clone()
+    } else if !spec.domain.is_empty() {
+        format!("{}@{}", spec.username, spec.domain)
+    } else {
+        spec.username.clone()
+    };
+    let password = spec.password.as_ref().map(|p| p.expose_secret()).unwrap_or("");
+    if !bind_dn.is_empty() {
+        println!("[*] Performing simple LDAP bind as '{}'...", bind_dn);
+        if let Err(e) = client.bind_simple(&bind_dn, password) {
+            eprintln!("[-] Bind failed: {}", e);
+            std::process::exit(1);
+        }
+        println!("[+] Bind successful");
+    } else {
+        println!("[*] Performing anonymous LDAP bind...");
+        let _ = client.bind_simple("", "");
+    }
+
     println!("[*] Querying RootDSE...");
     let attrs = [
         "supportedLDAPVersion",
