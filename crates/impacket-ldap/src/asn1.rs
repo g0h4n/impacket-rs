@@ -290,11 +290,11 @@ impl LdapMessage {
                             sasl_seq.push(der::encode_octet_string(creds));
                         }
                         let sasl_body = der::encode_sequence(&sasl_seq);
-                        bind_seq.push(der::encode_context_explicit(3, &sasl_body[2..]));
+                        bind_seq.push(der::reencode_with_tag(0xA3, &sasl_body));
                     }
                 }
                 let body = der::encode_sequence(&bind_seq);
-                elements.push(der::encode_tlv(op_tag::BIND_REQUEST, &body[2..]));
+                elements.push(der::reencode_with_tag(op_tag::BIND_REQUEST, &body));
             }
             ProtocolOp::UnbindRequest => {
                 elements.push(vec![op_tag::UNBIND_REQUEST, 0x00]);
@@ -325,7 +325,7 @@ impl LdapMessage {
                 search_seq.push(der::encode_sequence(&attr_elements));
 
                 let body = der::encode_sequence(&search_seq);
-                elements.push(der::encode_tlv(op_tag::SEARCH_REQUEST, &body[2..]));
+                elements.push(der::reencode_with_tag(op_tag::SEARCH_REQUEST, &body));
             }
             ProtocolOp::BindResponse {
                 result_code,
@@ -407,7 +407,7 @@ impl LdapMessage {
                 mod_seq.push(der::encode_sequence(&changes_der));
 
                 let body = der::encode_sequence(&mod_seq);
-                elements.push(der::encode_tlv(op_tag::MODIFY_REQUEST, &body[2..]));
+                elements.push(der::reencode_with_tag(op_tag::MODIFY_REQUEST, &body));
             }
             ProtocolOp::ModifyResponse {
                 result_code,
@@ -441,7 +441,7 @@ impl LdapMessage {
                 add_seq.push(der::encode_sequence(&attrs_der));
 
                 let body = der::encode_sequence(&add_seq);
-                elements.push(der::encode_tlv(op_tag::ADD_REQUEST, &body[2..]));
+                elements.push(der::reencode_with_tag(op_tag::ADD_REQUEST, &body));
             }
             ProtocolOp::AddResponse {
                 result_code,

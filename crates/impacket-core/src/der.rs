@@ -82,6 +82,22 @@ pub fn encode_sequence(elements: &[Vec<u8>]) -> Vec<u8> {
     encode_tlv(0x30, &body)
 }
 
+/// Re-wrap an already-encoded DER SEQUENCE under a different (application/context) tag,
+/// stripping the real SEQUENCE header whatever its length-of-length is (not a fixed 2 bytes).
+pub fn reencode_with_tag(tag: u8, encoded_sequence: &[u8]) -> Vec<u8> {
+    // encoded_sequence = [0x30][len bytes...][content]. Decode the header length properly.
+    if encoded_sequence.len() < 2 {
+        return encode_tlv(tag, &[]);
+    }
+    let first_len = encoded_sequence[1];
+    let hdr_len = if (first_len & 0x80) == 0 {
+        2
+    } else {
+        2 + (first_len & 0x7F) as usize
+    };
+    encode_tlv(tag, &encoded_sequence[hdr_len..])
+}
+
 pub fn encode_context_explicit(tag_num: u8, inner: &[u8]) -> Vec<u8> {
     encode_tlv(0xA0 | (tag_num & 0x1F), inner)
 }
