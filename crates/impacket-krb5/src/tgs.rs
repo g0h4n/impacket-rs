@@ -228,8 +228,8 @@ impl Krb5TgsReq {
 
         let mut req_body_elements = vec![
             der::encode_context_explicit(0, &kdc_options),
-            der::encode_context_explicit(2, &sname),
-            der::encode_context_explicit(3, &realm),
+            der::encode_context_explicit(2, &realm),
+            der::encode_context_explicit(3, &sname),
             der::encode_context_explicit(5, &till),
             der::encode_context_explicit(7, &nonce),
             der::encode_context_explicit(8, &etype_seq),
