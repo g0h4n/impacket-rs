@@ -31,6 +31,7 @@ pub use smbd::{
 pub use transform::{is_transform_header, Smb3EncryptionState, SmbCipherAlgorithm};
 
 use impacket_auth::{NtlmChallengeMessage, NtlmNegotiateMessage};
+use impacket_auth::spnego::{NegTokenInit, NegTokenResp};
 use impacket_core::{encode_utf16le, AdCompatProfile, CoreError, FileTime, NtStatus};
 use impacket_ndr::{ndr_struct, NdrDeserialize, NdrReader, NdrSerialize, NdrWriter};
 use std::io::{Read, Write};
@@ -1131,13 +1132,23 @@ impl SmbConnection {
             encryption_required: false,
         };
         // Offer the full SMB2/3 dialect set for this profile, including SMB 3.1.1.
-        let dialects = SmbDialect::dialects_for_profile(profile);
+        // let dialects = SmbDialect::dialects_for_profile(profile);
+        // SMB 3.1.1 preauth-integrity signing is not implemented yet: its signing key derives from
+        // the SHA-512 preauth hash over the full NEGOTIATE + SESSION_SETUP chain, and without it the
+        // server tears the session down (STATUS_USER_SESSION_DELETED). Cap at 3.0.2 (Impacket's
+        // default compromise); every Windows target from 2008R2 to 2022 accepts it. Re-enable 3.1.1
+        // once its preauth-integrity + signing path is implemented.
+        let dialects: Vec<SmbDialect> = SmbDialect::dialects_for_profile(profile)
+            .into_iter()
+            .filter(|d| *d != SmbDialect::Smb311)
+            .collect();
         let neg = build_smb2_negotiate_request_with_dialects(&dialects, profile, [0x99; 16]);
         conn.update_preauth(&neg);
         let resp = conn.send(&neg)?;
         conn.update_preauth(&resp);
         let summary = Smb2NegotiateResponseSummary::parse(&resp)?;
         conn.negotiated_dialect = summary.dialect_revision;
+        conn.message_id = 1; // NEGOTIATE consumed MessageId 0; next request (Session Setup) must be 1
         conn.signing_required = (summary.security_mode & 0x02) != 0;
         Ok(conn)
     }
@@ -1160,10 +1171,17 @@ impl SmbConnection {
             NtlmChallengeMessage, NtlmNegotiateMessage,
         };
 
-        // Type 1.
-        let type1 = NtlmNegotiateMessage::for_profile(AdCompatProfile::UniversalAuto).to_bytes();
+        // Type 1 matching Impacket: minimal SMB client flags (0xa0880205), no version block.
+        let type1: Vec<u8> = NtlmNegotiateMessage {
+            flags: ntlm_flags::SMB_CLIENT_FLAGS,
+            os_major: 0,
+            os_minor: 0,
+            os_build: 0,
+        }
+        .to_bytes();
         let mid = self.next_mid();
-        let setup1 = build_smb2_session_setup_request(mid, 0, &type1);
+        let type1_spnego = NegTokenInit::for_ntlmssp(&type1).to_bytes();
+        let setup1 = build_smb2_session_setup_request(mid, 0, &type1_spnego);
         self.update_preauth(&setup1);
         let resp1 = self.send(&setup1)?;
         self.update_preauth(&resp1);
@@ -1213,6 +1231,30 @@ impl SmbConnection {
             .timestamp
             .unwrap_or_else(|| FileTime::from_unix_secs(0));
 
+        // Impacket appends MsvAvTargetName (service SPN "cifs/<fqdn>") to the server's
+        // AV pairs before computing the NTLMv2 blob. The server recomputes NTProofStr
+        // over the AV pairs we actually send, so this stays self-consistent, and it
+        // satisfies servers that expect the SPN target-name binding.
+        let target_fqdn = challenge
+            .target_info
+            .dns_computer_name
+            .as_deref()
+            .unwrap_or("");
+        let target_info_for_blob: Vec<u8> =
+            if target_fqdn.is_empty() || target_info_raw.len() < 4 {
+                target_info_raw.to_vec()
+            } else {
+                let spn = format!("cifs/{}", target_fqdn);
+                let spn_u16 = encode_utf16le(&spn);
+                // Strip trailing MsvAvEOL (4 zero bytes), append MsvAvTargetName (id 0x0009), re-add EOL.
+                let mut ti = target_info_raw[..target_info_raw.len() - 4].to_vec();
+                ti.extend_from_slice(&0x0009u16.to_le_bytes());
+                ti.extend_from_slice(&(spn_u16.len() as u16).to_le_bytes());
+                ti.extend_from_slice(&spn_u16);
+                ti.extend_from_slice(&[0, 0, 0, 0]); // MsvAvEOL
+                ti
+            };
+
         let v2 = compute_ntlmv2_response(
             username,
             domain,
@@ -1220,8 +1262,9 @@ impl SmbConnection {
             &challenge.server_challenge,
             &client_challenge,
             timestamp,
-            target_info_raw,
+            &target_info_for_blob,
         );
+
         // With NTLMSSP_NEGOTIATE_KEY_EXCH cleared, the exported session key is the session base key.
         let session_key = v2.session_base_key;
         self.session_key = session_key;
@@ -1233,15 +1276,23 @@ impl SmbConnection {
             lm_challenge_response: v2.lm_challenge_response,
             nt_challenge_response: v2.nt_challenge_response,
             encrypted_session_key: Vec::new(),
-            flags: challenge.flags & !ntlm_flags::NTLMSSP_NEGOTIATE_KEY_EXCH,
-            os_major: 10,
+            flags: ntlm_flags::SMB_CLIENT_FLAGS,
+            os_major: 0,
             os_minor: 0,
-            os_build: 19041,
+            os_build: 0,
+            mic: None,
         }
         .to_bytes();
 
         let mid = self.next_mid();
-        let setup2 = build_smb2_session_setup_request(mid, self.session_id, &type3);
+        let type3_spnego = NegTokenResp {
+            neg_state: None,
+            supported_mech: None,
+            response_token: Some(type3.clone()),
+            mech_list_mic: None,
+        }
+        .to_bytes();
+        let setup2 = build_smb2_session_setup_request(mid, self.session_id, &type3_spnego);
         // Fold the final SESSION_SETUP request into the preauth hash BEFORE deriving the 3.1.1 key.
         self.update_preauth(&setup2);
         let resp2 = self.send(&setup2)?;

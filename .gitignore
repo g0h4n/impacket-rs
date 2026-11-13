@@ -14,3 +14,4 @@ HANDOFF.md
 *.tmp
 test_*.txt
 *.pcap
+impacket-rs

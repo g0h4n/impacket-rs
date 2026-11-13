@@ -201,6 +201,7 @@ impl<S: Read + Write> MssqlClient<S> {
             os_major: 10,
             os_minor: 0,
             os_build: 19041,
+            mic: None,
         };
 
         let type3_bytes = auth_msg.to_bytes();

@@ -1207,6 +1207,7 @@ mod tests {
             os_major: 10,
             os_minor: 0,
             os_build: 19041,
+            mic: None,
         };
         let ss_req_2 = crate::build_smb2_session_setup_request(2, state.session_id, &ntlm_auth.to_bytes());
         let ss_resp_2 = server

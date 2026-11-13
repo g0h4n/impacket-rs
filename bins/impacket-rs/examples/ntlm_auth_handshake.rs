@@ -77,6 +77,7 @@ fn main() {
         os_major: 10,
         os_minor: 0,
         os_build: 26100,
+        mic: None,
     };
     let type3_bytes = type3.to_bytes();
 

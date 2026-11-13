@@ -44,6 +44,19 @@ pub mod ntlm_flags {
         | NTLMSSP_NEGOTIATE_128
         | NTLMSSP_NEGOTIATE_KEY_EXCH
         | NTLMSSP_NEGOTIATE_56;
+    /// NTLMSSP flags for the SMB exchange (Type 1 and Type 3), matching Impacket's `smbclient`.
+    /// Minimal and interoperable from Windows Server 2008 R2 through 2025 (= 0xa0880205).
+    /// Deliberately NO SIGN/SEAL/KEY_EXCH/VERSION: SMB performs signing and encryption at the
+    /// SMB2/3 layer with the derived session key. Advertising these at the NTLM layer makes the
+    /// server expect a MIC or a key-exchange blob in the Type 3, and it rejects the message with
+    /// STATUS_INVALID_PARAMETER.
+    pub const SMB_CLIENT_FLAGS: u32 = NTLMSSP_NEGOTIATE_UNICODE
+        | NTLMSSP_REQUEST_TARGET
+        | NTLMSSP_NEGOTIATE_NTLM
+        | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        | NTLMSSP_NEGOTIATE_TARGET_INFO
+        | NTLMSSP_NEGOTIATE_128
+        | NTLMSSP_NEGOTIATE_56;
 }
 
 /// Computes both LM and NT hashes from a cleartext password.
@@ -114,20 +127,27 @@ impl NtlmNegotiateMessage {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(40);
+        let has_version = self.flags & ntlm_flags::NTLMSSP_NEGOTIATE_VERSION != 0;
+        // Header is 32 bytes; the 8-byte Version block follows only when NEGOTIATE_VERSION is set.
+        let header_len: u32 = if has_version { 40 } else { 32 };
+        let mut buf = Vec::with_capacity(header_len as usize);
         buf.extend_from_slice(b"NTLMSSP\x00");
-        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // MessageType = 1
         buf.extend_from_slice(&self.flags.to_le_bytes());
+        // DomainNameFields (empty): Len, MaxLen, Offset
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&40u32.to_le_bytes());
+        buf.extend_from_slice(&header_len.to_le_bytes());
+        // WorkstationFields (empty): Len, MaxLen, Offset
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&40u32.to_le_bytes());
-        buf.push(self.os_major);
-        buf.push(self.os_minor);
-        buf.extend_from_slice(&self.os_build.to_le_bytes());
-        buf.extend_from_slice(&[0, 0, 0, 15]);
+        buf.extend_from_slice(&header_len.to_le_bytes());
+        if has_version {
+            buf.push(self.os_major);
+            buf.push(self.os_minor);
+            buf.extend_from_slice(&self.os_build.to_le_bytes());
+            buf.extend_from_slice(&[0, 0, 0, 15]); // Reserved + NTLMRevisionCurrent
+        }
         buf
     }
 
@@ -496,8 +516,14 @@ pub fn compute_ntlmv2_response(
 
     let session_base_key = hmac_md5(&response_key_nt, &nt_proof_str);
 
-    // When MsvAvTimestamp is present, Windows sets LMv2 response to 24 zero bytes
-    let lm_challenge_response = vec![0u8; 24];
+    // LMv2 response: HMAC-MD5(response_key, server_challenge ‖ client_challenge) ‖ client_challenge
+    let mut lm_input = Vec::with_capacity(16);
+    lm_input.extend_from_slice(server_challenge);
+    lm_input.extend_from_slice(client_challenge);
+    let lm_hash = hmac_md5(&response_key_nt, &lm_input);
+    let mut lm_challenge_response = Vec::with_capacity(24);
+    lm_challenge_response.extend_from_slice(&lm_hash);
+    lm_challenge_response.extend_from_slice(client_challenge);
 
     NtlmComputedResponses {
         lm_challenge_response,
@@ -523,20 +549,28 @@ pub struct NtlmAuthenticateMessage {
     pub os_major: u8,
     pub os_minor: u8,
     pub os_build: u16,
+    pub mic: Option<[u8; 16]>,
 }
 
 impl NtlmAuthenticateMessage {
-    /// Fixed-header size with a version block and no MIC.
-    const PAYLOAD_BASE: u32 = 72;
-
     pub fn to_bytes(&self) -> Vec<u8> {
         let domain = encode_utf16le(&self.domain);
         let user = encode_utf16le(&self.username);
         let workstation = encode_utf16le(&self.workstation);
 
+        let has_version = self.flags & ntlm_flags::NTLMSSP_NEGOTIATE_VERSION != 0;
+        let has_mic = self.mic.is_some();
+
+        // Fixed header is 64 bytes. The 8-byte Version block is emitted ONLY when
+        // NEGOTIATE_VERSION is advertised; a client that does not advertise it (like
+        // Impacket here) omits it entirely => payloads start at offset 64, not 72.
+        // The optional 16-byte MIC follows the version slot.
+        let header_len: u32 =
+            64 + if has_version { 8 } else { 0 } + if has_mic { 16 } else { 0 };
+
         // Payload order: LM, NT, Domain, User, Workstation, SessionKey.
         let mut payload = Vec::new();
-        let mut base = Self::PAYLOAD_BASE;
+        let mut base = header_len;
         let mut sec_bufs = Vec::with_capacity(6);
         for field in [
             &self.lm_challenge_response,
@@ -552,7 +586,7 @@ impl NtlmAuthenticateMessage {
             base += len as u32;
         }
 
-        let mut buf = Vec::with_capacity(Self::PAYLOAD_BASE as usize + payload.len());
+        let mut buf = Vec::with_capacity(header_len as usize + payload.len());
         buf.extend_from_slice(b"NTLMSSP\x00");
         buf.extend_from_slice(&3u32.to_le_bytes()); // MessageType = 3
         for (len, offset) in &sec_bufs {
@@ -561,11 +595,18 @@ impl NtlmAuthenticateMessage {
             buf.extend_from_slice(&offset.to_le_bytes()); // BufferOffset
         }
         buf.extend_from_slice(&self.flags.to_le_bytes());
-        buf.push(self.os_major);
-        buf.push(self.os_minor);
-        buf.extend_from_slice(&self.os_build.to_le_bytes());
-        buf.extend_from_slice(&[0, 0, 0, 15]); // Reserved + NTLMRevisionCurrent
-        debug_assert_eq!(buf.len(), Self::PAYLOAD_BASE as usize);
+        // Version block: present only when NEGOTIATE_VERSION is set.
+        if has_version {
+            buf.push(self.os_major);
+            buf.push(self.os_minor);
+            buf.extend_from_slice(&self.os_build.to_le_bytes());
+            buf.extend_from_slice(&[0, 0, 0, 15]); // Reserved + NTLMRevisionCurrent
+        }
+        // 16-byte MIC right after the version slot (MS-NLMP 3.1.5.1.2).
+        if let Some(mic) = self.mic {
+            buf.extend_from_slice(&mic);
+        }
+        debug_assert_eq!(buf.len(), header_len as usize);
         buf.extend_from_slice(&payload);
         buf
     }
@@ -659,6 +700,7 @@ impl NtlmAuthenticateMessage {
             os_major,
             os_minor,
             os_build,
+            mic: None,
         })
     }
 
@@ -809,6 +851,7 @@ mod tests {
             os_major: 10,
             os_minor: 0,
             os_build: 19041,
+            mic: None,
         };
         let bytes = msg.to_bytes();
         assert_eq!(&bytes[0..8], b"NTLMSSP\x00");
