@@ -88,7 +88,6 @@ pub fn smbexec(
     conn.login(domain, username, credential, "impacket-rs")?;
     conn.tree_connect_share(host, "C$")?;
 
-    let mut last_err: Option<CoreError> = None;
     // Poll the output file. The shell creates it, holds it open while the command writes
     // (STATUS_SHARING_VIOLATION), then releases it; an empty read is the brief window before the
     // command writes. Keep polling until we get data (or time out). Mirrors Impacket, which
