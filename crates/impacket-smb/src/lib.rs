@@ -1132,16 +1132,16 @@ impl SmbConnection {
             encryption_required: false,
         };
         // Offer the full SMB2/3 dialect set for this profile, including SMB 3.1.1.
-        // let dialects = SmbDialect::dialects_for_profile(profile);
+        let dialects = SmbDialect::dialects_for_profile(profile);
         // SMB 3.1.1 preauth-integrity signing is not implemented yet: its signing key derives from
         // the SHA-512 preauth hash over the full NEGOTIATE + SESSION_SETUP chain, and without it the
         // server tears the session down (STATUS_USER_SESSION_DELETED). Cap at 3.0.2 (Impacket's
         // default compromise); every Windows target from 2008R2 to 2022 accepts it. Re-enable 3.1.1
         // once its preauth-integrity + signing path is implemented.
-        let dialects: Vec<SmbDialect> = SmbDialect::dialects_for_profile(profile)
-            .into_iter()
-            .filter(|d| *d != SmbDialect::Smb311)
-            .collect();
+        // let dialects: Vec<SmbDialect> = SmbDialect::dialects_for_profile(profile)
+        //     .into_iter()
+        //     .filter(|d| *d != SmbDialect::Smb311)
+        //     .collect();
         let neg = build_smb2_negotiate_request_with_dialects(&dialects, profile, [0x99; 16]);
         conn.update_preauth(&neg);
         let resp = conn.send(&neg)?;
@@ -1171,9 +1171,21 @@ impl SmbConnection {
             NtlmChallengeMessage, NtlmNegotiateMessage,
         };
 
-        // Type 1 matching Impacket: minimal SMB client flags (0xa0880205), no version block.
+        // NTLM flags mirror Impacket: KEY_EXCH|SIGN|SEAL|ALWAYS_SIGN are added only when the server
+        // requires signing. The SMB signing/encryption keys then derive from an exchanged random
+        // session key (below), which a signing-required SMB 3.1.1 server demands.
+        let ntlm_flags_base = {
+            let mut f = ntlm_flags::SMB_CLIENT_FLAGS;
+            if self.signing_required {
+                f |= ntlm_flags::NTLMSSP_NEGOTIATE_SIGN
+                    | ntlm_flags::NTLMSSP_NEGOTIATE_SEAL
+                    | ntlm_flags::NTLMSSP_NEGOTIATE_ALWAYS_SIGN
+                    | ntlm_flags::NTLMSSP_NEGOTIATE_KEY_EXCH;
+            }
+            f
+        };
         let type1: Vec<u8> = NtlmNegotiateMessage {
-            flags: ntlm_flags::SMB_CLIENT_FLAGS,
+            flags: ntlm_flags_base,
             os_major: 0,
             os_minor: 0,
             os_build: 0,
@@ -1264,9 +1276,47 @@ impl SmbConnection {
             timestamp,
             &target_info_for_blob,
         );
+        // Type 3 flags: start from the Type 1 set, clear anything the server did not offer.
+        let mut type3_flags = ntlm_flags_base;
+        for f in [
+            ntlm_flags::NTLMSSP_NEGOTIATE_SIGN,
+            ntlm_flags::NTLMSSP_NEGOTIATE_SEAL,
+            ntlm_flags::NTLMSSP_NEGOTIATE_ALWAYS_SIGN,
+            ntlm_flags::NTLMSSP_NEGOTIATE_KEY_EXCH,
+            ntlm_flags::NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY,
+            ntlm_flags::NTLMSSP_NEGOTIATE_128,
+        ] {
+            if challenge.flags & f == 0 {
+                type3_flags &= !f;
+            }
+        }
 
-        // With NTLMSSP_NEGOTIATE_KEY_EXCH cleared, the exported session key is the session base key.
-        let session_key = v2.session_base_key;
+        // KXKEY for NTLMv2 is the session base key. With NEGOTIATE_KEY_EXCH, generate a random
+        // ExportedSessionKey and ship it RC4-encrypted under the KXKEY; otherwise the
+        // ExportedSessionKey IS the session base key. SMB signing/encryption keys derive from it.
+        let key_exchange_key = v2.session_base_key;
+        let (exported_session_key, encrypted_session_key) =
+            if type3_flags & ntlm_flags::NTLMSSP_NEGOTIATE_KEY_EXCH != 0 {
+                let mut rnd = [0u8; 16];
+                let mut x = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x1337_1337_1337_1337)
+                    ^ 0x9E37_79B9_7F4A_7C15;
+                for chunk in rnd.chunks_mut(8) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let b = x.to_le_bytes();
+                    chunk.copy_from_slice(&b[..chunk.len()]);
+                }
+                let mut enc = rnd;
+                impacket_crypto::Rc4::new(&key_exchange_key).apply_keystream(&mut enc);
+                (rnd, enc.to_vec())
+            } else {
+                (key_exchange_key, Vec::new())
+            };
+        let session_key = exported_session_key;
         self.session_key = session_key;
 
         let type3 = NtlmAuthenticateMessage {
@@ -1275,8 +1325,8 @@ impl SmbConnection {
             workstation: workstation.to_string(),
             lm_challenge_response: v2.lm_challenge_response,
             nt_challenge_response: v2.nt_challenge_response,
-            encrypted_session_key: Vec::new(),
-            flags: ntlm_flags::SMB_CLIENT_FLAGS,
+            encrypted_session_key,
+            flags: type3_flags,
             os_major: 0,
             os_minor: 0,
             os_build: 0,
@@ -1293,7 +1343,8 @@ impl SmbConnection {
         }
         .to_bytes();
         let setup2 = build_smb2_session_setup_request(mid, self.session_id, &type3_spnego);
-        // Fold the final SESSION_SETUP request into the preauth hash BEFORE deriving the 3.1.1 key.
+        // Fold the final (unsigned) SESSION_SETUP request into the preauth hash before deriving
+        // keys. Impacket does NOT sign this request: SigningActivated is still false here.
         self.update_preauth(&setup2);
         let resp2 = self.send(&setup2)?;
         let status2 = Self::header_status(&resp2)?;
@@ -1301,34 +1352,24 @@ impl SmbConnection {
             return Err(CoreError::NtStatus(status2));
         }
 
-        // Derive the SMB2 signing key now that the session key is established (`[MS-SMB2] 3.1.4.2`).
+        // Derive the SMB2 signing key from the ExportedSessionKey ([MS-SMB2] 3.1.4.2).
         self.signing = match self.negotiated_dialect {
             0x0311 => {
-                // SMB 3.1.1: AES-CMAC key = KDF(SessionKey, "SMBSigningKey\0", PreauthHash).
                 let sk = impacket_crypto::sp800_108_counter_kdf(
-                    &session_key,
-                    b"SMBSigningKey\0",
-                    &self.preauth,
-                    16,
+                    &session_key, b"SMBSigningKey\0", &self.preauth, 16,
                 );
                 Some((sk.try_into().unwrap(), true))
             }
             0x0300 | 0x0302 => {
-                // SMB 3.0/3.0.2: AES-CMAC key = KDF(SessionKey, "SMB2AESCMAC\0", "SmbSign\0").
                 let sk = impacket_crypto::sp800_108_counter_kdf(
-                    &session_key,
-                    b"SMB2AESCMAC\0",
-                    b"SmbSign\0",
-                    16,
+                    &session_key, b"SMB2AESCMAC\0", b"SmbSign\0", 16,
                 );
                 Some((sk.try_into().unwrap(), true))
             }
-            // SMB 2.0.2 / 2.1: HMAC-SHA256 with the session key directly.
             0x0202 | 0x0210 => Some((session_key, false)),
             _ => None,
         };
 
-        // Derive SMB 3.x transport encryption keys (`[MS-SMB2]` 3.1.4.2).
         self.encryption = match self.negotiated_dialect {
             0x0311 => Some(transform::Smb3EncryptionState::new_smb311(
                 &session_key,
