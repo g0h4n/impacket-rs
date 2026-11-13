@@ -40,10 +40,15 @@ pub fn smbexec(
     let token = rand_token();
     let service_name = format!("ImpacketRs{}", token);
     let output_file = format!("__{}", token);
-    // The service runs as SYSTEM on the target; it writes output to the target's own C$ via loopback.
+    let batch_file = format!(r"%TEMP%\{}.bat", token);
+    // Match Impacket: write the command + redirect into a local batch file, then run it. A redirect
+    // placed directly in the service ImagePath is unreliable (the SCM CreateProcess's it without a
+    // shell); the batch indirection reliably captures stdout+stderr to the loopback C$ file.
     let bin_path = format!(
-        r"%COMSPEC% /Q /c {} > \\127.0.0.1\C$\{} 2>&1",
-        command, output_file
+        r"%COMSPEC% /Q /c echo {cmd} ^> \\127.0.0.1\C$\{out} 2^>^&1 > {bat} & %COMSPEC% /Q /c {bat} & del {bat}",
+        cmd = command,
+        out = output_file,
+        bat = batch_file,
     );
 
     // 1. Create + start + delete the service over \PIPE\svcctl.
@@ -84,17 +89,33 @@ pub fn smbexec(
     conn.tree_connect_share(host, "C$")?;
 
     let mut last_err: Option<CoreError> = None;
+    // Poll the output file. The shell creates it, holds it open while the command writes
+    // (STATUS_SHARING_VIOLATION), then releases it; an empty read is the brief window before the
+    // command writes. Keep polling until we get data (or time out). Mirrors Impacket, which
+    // retries on STATUS_SHARING_VIOLATION until the file is readable.
+    let mut saw_file = false;
+    let mut last_err: Option<CoreError> = None;
     for _ in 0..10 {
         match conn.read_full_file(&output_file) {
-            Ok(bytes) => {
+            Ok(bytes) if !bytes.is_empty() => {
                 let _ = conn.delete_file(&output_file);
                 return Ok(String::from_utf8_lossy(&bytes).into_owned());
             }
+            Ok(_) => {
+                // Exists but empty: the command has not finished writing yet.
+                saw_file = true;
+            }
             Err(e) => {
+                // STATUS_SHARING_VIOLATION (still writing) or not-yet-created.
                 last_err = Some(e);
-                std::thread::sleep(Duration::from_millis(1000));
             }
         }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Readable but stayed empty => the command genuinely produced no output.
+    if saw_file {
+        let _ = conn.delete_file(&output_file);
+        return Ok(String::new());
     }
     Err(last_err.unwrap_or_else(|| CoreError::ProtocolError("smbexec: output file never appeared".into())))
 }
