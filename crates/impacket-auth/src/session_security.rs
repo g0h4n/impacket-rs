@@ -92,13 +92,15 @@ impl NtlmSessionSecurity {
         let mut ciphertext = message.to_vec();
         self.client_rc4.apply_keystream(&mut ciphertext);
 
-        let mut enc_seq = seq.to_le_bytes();
-        self.client_rc4.apply_keystream(&mut enc_seq);
+        // With KEY_EXCH the checksum is sealed with the same RC4 handle, right after the message.
+        let mut checksum = [0u8; 8];
+        checksum.copy_from_slice(&hmac[0..8]);
+        self.client_rc4.apply_keystream(&mut checksum);
 
         let mut sig = [0u8; 16];
-        sig[0..4].copy_from_slice(&1u32.to_le_bytes());
-        sig[4..12].copy_from_slice(&hmac[0..8]);
-        sig[12..16].copy_from_slice(&enc_seq);
+        sig[0..4].copy_from_slice(&1u32.to_le_bytes()); // Version
+        sig[4..12].copy_from_slice(&checksum); // sealed checksum
+        sig[12..16].copy_from_slice(&seq.to_le_bytes()); // plaintext SeqNum
 
         (ciphertext, sig)
     }
