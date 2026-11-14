@@ -1092,6 +1092,23 @@ impl SmbConnection {
         }
     }
 
+    /// Reads and decrypts one SMB2 packet from the stream (no send). Used to drain the final
+    /// response after the server sent an interim STATUS_PENDING.
+    fn recv(&mut self) -> Result<Vec<u8>, CoreError> {
+        let resp = read_netbios_packet(&mut self.stream)?;
+        if transform::is_transform_header(&resp) {
+            if let Some(enc) = &self.encryption {
+                enc.decrypt(&resp)
+            } else {
+                Err(CoreError::ProtocolError(
+                    "Received encrypted SMB3 message but no encryption key established".into(),
+                ))
+            }
+        } else {
+            Ok(resp)
+        }
+    }
+
     /// Signs (when a session key is established) and sends an SMB2 request.
     fn send_signed(&mut self, mut pdu: Vec<u8>) -> Result<Vec<u8>, CoreError> {
         self.sign(&mut pdu);
@@ -1455,20 +1472,24 @@ impl SmbConnection {
     pub fn transact_pipe(&mut self, file_id: [u8; 16], rpc_pdu: &[u8]) -> Result<Vec<u8>, CoreError> {
         let mid = self.next_mid();
         let req = build_smb2_pipe_transceive_request(mid, self.session_id, self.tree_id, file_id, rpc_pdu);
-        let resp = self.send_signed(req)?;
-        let status = Self::header_status(&resp)?;
-        // STATUS_BUFFER_OVERFLOW (0x80000005) means more pipe data remains; we treat the returned
-        // output as the (possibly first) fragment. Success is the common case for small PDUs.
-        if !status.is_success() && status.0 != 0x8000_0005 {
-            return Err(CoreError::NtStatus(status));
+        let mut resp = self.send_signed(req)?;
+        loop {
+            let status = Self::header_status(&resp)?;
+            // STATUS_PENDING (0x00000103): the server will deliver the real response asynchronously
+            // on the same MessageId (common for slow ops like BaseRegSaveKey). Read the next packet.
+            if status.0 == 0x0000_0103 {
+                resp = self.recv()?;
+                continue;
+            }
+            // STATUS_BUFFER_OVERFLOW (0x80000005) means more pipe data remains; treat the returned
+            // output as the first fragment. Success is the common case for small PDUs.
+            if !status.is_success() && status.0 != 0x8000_0005 {
+                return Err(CoreError::NtStatus(status));
+            }
+            break;
         }
-        // SMB2 IOCTL Response layout: header(64) + StructureSize(2) + Reserved(2) + CtlCode(4) +
-        // FileId(16) + InputOffset(4) + InputCount(4) => OutputOffset@96, OutputCount@100, Buffer@112.
         if resp.len() < 104 {
-            return Err(CoreError::BufferUnderflow {
-                needed: 104,
-                available: resp.len(),
-            });
+            return Err(CoreError::BufferUnderflow { needed: 104, available: resp.len() });
         }
         let output_offset = u32::from_le_bytes([resp[96], resp[97], resp[98], resp[99]]) as usize;
         let output_count = u32::from_le_bytes([resp[100], resp[101], resp[102], resp[103]]) as usize;

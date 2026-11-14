@@ -278,31 +278,31 @@ pub fn hashed_bootkey_from_f(f: &[u8], bootkey: &[u8; 16]) -> Result<[u8; 16], C
     if f.len() < 0x74 {
         return Err(CoreError::BufferUnderflow { needed: 0x74, available: f.len() });
     }
-    let revision = rd_u32_le(f, 0x70)?;
+    let revision = rd_u32_le(f, 0x68)?;
     match revision {
         1 => {
             let salt: [u8; 16] = f
-                .get(0x78..0x88)
-                .ok_or(CoreError::BufferUnderflow { needed: 0x88, available: f.len() })?
+                .get(0x70..0x80)
+                .ok_or(CoreError::BufferUnderflow { needed: 0x80, available: f.len() })?
                 .try_into()
                 .unwrap();
             let enc: [u8; 32] = f
-                .get(0x88..0xA8)
-                .ok_or(CoreError::BufferUnderflow { needed: 0xA8, available: f.len() })?
+                .get(0x80..0xA0)
+                .ok_or(CoreError::BufferUnderflow { needed: 0xA0, available: f.len() })?
                 .try_into()
                 .unwrap();
             derive_hashed_bootkey_rc4(bootkey, &salt, &enc)
         }
         2 | 3 => {
-            let data_len = rd_u32_le(f, 0x7C)? as usize;
+            let data_len = rd_u32_le(f, 0x74)? as usize;
             let salt: [u8; 16] = f
-                .get(0x80..0x90)
-                .ok_or(CoreError::BufferUnderflow { needed: 0x90, available: f.len() })?
+                .get(0x78..0x88)
+                .ok_or(CoreError::BufferUnderflow { needed: 0x88, available: f.len() })?
                 .try_into()
                 .unwrap();
             let data = f
-                .get(0x90..0x90 + data_len)
-                .ok_or(CoreError::BufferUnderflow { needed: 0x90 + data_len, available: f.len() })?;
+                .get(0x88..0x88 + data_len)
+                .ok_or(CoreError::BufferUnderflow { needed: 0x88 + data_len, available: f.len() })?;
             derive_hashed_bootkey_aes(bootkey, &salt, data)
         }
         other => Err(CoreError::ProtocolError(format!("unknown SAM_KEY_DATA revision {}", other))),

@@ -226,7 +226,10 @@ pub const ERROR_NO_MORE_ITEMS: u32 = 259;
 /// referent). Caller defers the NUL-terminated buffer with [`write_string_wchar_pointee`].
 fn write_rrp_unicode_string_header(w: &mut NdrWriter, s: &str, referent: u32) {
     let chars = (encode_utf16le(s).len() / 2) as u16;
-    w.write_u16(chars * 2); // Length (bytes, no NUL)
+    // Length and MaximumLength BOTH count the NUL terminator, matching the buffer's ActualCount
+    // (write_string_wchar_pointee writes chars+1). A Length without the NUL makes length_is
+    // disagree with ActualCount and the server faults with RPC_X_BAD_STUB_DATA (0x6F7).
+    w.write_u16((chars + 1) * 2); // Length (incl NUL)
     w.write_u16((chars + 1) * 2); // MaximumLength (incl NUL)
     w.write_u32(referent);
 }
@@ -276,10 +279,9 @@ pub fn build_base_reg_open_key_stub(
     let mut w = NdrWriter::with_capacity(64);
     w.write_fixed_array(hkey);
     write_rrp_unicode_string_header(&mut w, subkey, REFERENT_BASE);
+    write_string_wchar_pointee(&mut w, subkey); // buffer right after header (match Impacket)
     w.write_u32(options);
     w.write_u32(sam_desired);
-    // Deferred string buffer (NUL-terminated).
-    write_string_wchar_pointee(&mut w, subkey);
     w.into_bytes()
 }
 
@@ -414,8 +416,8 @@ pub fn build_base_reg_save_key_stub(hkey: &RegHandle, filename: &str) -> Vec<u8>
     let mut w = NdrWriter::with_capacity(64);
     w.write_fixed_array(hkey);
     write_rrp_unicode_string_header(&mut w, filename, REFERENT_BASE);
+    write_string_wchar_pointee(&mut w, filename); // deferred buffer BEFORE pSA (match Impacket)
     w.write_u32(0); // pSecurityAttributes [unique] = NULL
-    write_string_wchar_pointee(&mut w, filename); // deferred buffer
     w.into_bytes()
 }
 
