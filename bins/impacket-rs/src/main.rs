@@ -3415,6 +3415,25 @@ fn smb_upload_recursive(
     Ok(count)
 }
 
+/// Resolves `arg` against the current SMB dir `cur` (both `\`-separated, no leading/trailing `\`).
+/// Handles `/`→`\`, absolute (`\`-prefixed), `.` and `..`.
+fn smb_resolve(cur: &str, arg: &str) -> String {
+    let arg = arg.replace('/', "\\");
+    let mut parts: Vec<&str> = if arg.starts_with('\\') {
+        Vec::new()
+    } else {
+        cur.split('\\').filter(|s| !s.is_empty()).collect()
+    };
+    for seg in arg.split('\\').filter(|s| !s.is_empty()) {
+        match seg {
+            "." => {}
+            ".." => { parts.pop(); }
+            s => parts.push(s),
+        }
+    }
+    parts.join("\\")
+}
+
 fn cmd_smbclient(args: &[String]) {
     use std::io::{self, Write};
     print!("{}", version::BANNER);
@@ -3492,12 +3511,14 @@ fn cmd_smbclient(args: &[String]) {
             println!("[*] Executing {} batch command(s)...", batch_commands.len());
         }
         let mut current_share: Option<String> = None;
+        let mut current_dir = String::new();
         let stdin = io::stdin();
         let is_batch = !batch_commands.is_empty();
         let mut batch_i = 0;
         loop {
             let prompt = match &current_share {
-                Some(s) => format!("smb: \\\\{}\\{}> ", host, s),
+                Some(s) if current_dir.is_empty() => format!("smb: \\\\{}\\{}> ", host, s),
+                Some(s) => format!("smb: \\\\{}\\{}\\{}\\> ", host, s, current_dir),
                 None => format!("smb: \\\\{}> ", host),
             };
             let cmd_str = if is_batch {
@@ -3528,6 +3549,8 @@ fn cmd_smbclient(args: &[String]) {
                     println!("  shares                                   List remote shares");
                     println!("  use <share>                              Connect to a share");
                     println!("  ls [path]                                List directory contents");
+                    println!("  cd <dir>                                 Change remote directory");
+                    println!("  pwd                                      Print current remote directory");
                     println!("  get <remote_file> [local_file]           Download file");
                     println!("  mget <remote_dir> [local_dir]            Download directory recursively");
                     println!("  put <local_file> [remote_file]           Upload file");
@@ -3567,17 +3590,30 @@ fn cmd_smbclient(args: &[String]) {
                         Ok(_) => {
                             println!("[+] Connected to share '{}'", share);
                             current_share = Some(share.to_string());
+                            current_dir = String::new();
                         }
                         Err(e) => eprintln!("[-] failed connecting to share '{}': {}", share, e),
                     }
                 }
+                "cd" => {
+                    if current_share.is_none() {
+                        eprintln!("[-] Select a share first with 'use <share>'");
+                        continue;
+                    }
+                    let target = smb_resolve(&current_dir, parts.get(1).copied().unwrap_or(""));
+                    match conn.list_directory(&target) {
+                        Ok(_) => current_dir = target,
+                        Err(e) => eprintln!("[-] cd: cannot access '\\{}': {}", target, e),
+                    }
+                }
+                "pwd" => println!("\\{}", current_dir),
                 "ls" | "dir" => {
                     if current_share.is_none() {
                         eprintln!("[-] Select a share first with 'use <share>'");
                         continue;
                     }
-                    let path = parts.get(1).copied().unwrap_or("");
-                    match conn.list_directory(path) {
+                    let path = smb_resolve(&current_dir, parts.get(1).copied().unwrap_or(""));
+                    match conn.list_directory(&path) {
                         Ok(entries) => display_directory_listing(&entries),
                         Err(e) => eprintln!("[-] list directory error: {}", e),
                     }
@@ -3591,7 +3627,7 @@ fn cmd_smbclient(args: &[String]) {
                         eprintln!("[-] usage: get <remote_file> [local_file]");
                         continue;
                     }
-                    let remote_path = parts[1];
+                    let remote_path = &smb_resolve(&current_dir, parts[1]);
                     let local_path = parts.get(2).copied().unwrap_or_else(|| {
                         remote_path.rsplit(&['/', '\\'][..]).next().unwrap_or(remote_path)
                     });
